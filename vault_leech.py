@@ -1,0 +1,238 @@
+"""Vault LEECH server: downloads torrents / magnet links / direct links ON THE SERVER and sends them straight into your
+encrypted Discord vault. Nothing goes through your PC. Run it on an always-on machine (a VPS or home server), not on your PC.
+
+Needs (on that server):  aria2   +   pip install flask requests cryptography
+Put it in the same folder as vault_server.py (it only reads your token and channel from there, nothing is changed).
+Set two secrets before starting:
+    VAULT_PASSWORD = your vault password (used to encrypt, same one you unlock the vault with)
+    LEECH_KEY      = a long random access key for this page (you choose it)
+Linux:    export VAULT_PASSWORD='...' LEECH_KEY='...' ; python3 vault_leech.py
+Then open  http://SERVER-IP:8790  and enter the access key once."""
+import json, mimetypes, os, queue, re, secrets, shutil, subprocess, sys, threading, time
+from urllib.parse import parse_qs, unquote, urlparse
+
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from flask import Flask, Response, abort, jsonify, request
+
+import vault_server as V   # token, channel and the 9 MB chunk size only
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DL = os.path.join(HERE, "leech_tmp")      # temporary download folder, emptied after each job
+PORT = int(os.environ.get("LEECH_PORT") or os.environ.get("PORT") or 8790)   # hosts like Render set PORT themselves
+app = Flask(__name__)
+AES = None
+JOBS, ORDER, Q = {}, [], queue.Queue()
+LOCK = threading.Lock()
+
+
+class Cancelled(Exception):
+    pass
+
+
+def seal(b):
+    iv = os.urandom(12)
+    return iv + AES.encrypt(iv, b, None)
+
+
+def send(content, fname, blob):
+    for a in range(6):
+        try:
+            V.dc("POST", f"/channels/{V.CH}/messages", data={"content": content}, files={"files[0]": (fname, blob)})
+            return
+        except Exception:
+            if a == 5:
+                raise
+            time.sleep(min(30, 3 * (a + 1)))
+
+
+def put_file(path, name, job, base_done, total):
+    size = os.path.getsize(path)
+    n = max(1, -(-size // V.CHUNK))
+    fid = secrets.token_hex(6)
+    meta = json.dumps({"name": name, "type": mimetypes.guess_type(name)[0] or "", "size": size, "t": int(time.time() * 1000)}).encode()
+    send(f"v1 {fid} m {n}", f"m{fid}.bin", seal(meta))
+    with open(path, "rb") as f:
+        for i in range(n):
+            if job["cancel"]:
+                raise Cancelled()
+            data = f.read(V.CHUNK)
+            send(f"v1 {fid} c{i} {n}", f"{fid}.{i}.bin", seal(data))
+            job["pct"] = round(100 * (base_done + min(size, (i + 1) * V.CHUNK)) / max(1, total))
+    return size
+
+
+def guess_name(link):
+    if link.startswith("magnet:"):
+        dn = parse_qs(urlparse(link).query).get("dn")
+        return dn[0] if dn else "magnet link"
+    return unquote(os.path.basename(urlparse(link).path)) or link[:60]
+
+
+def run(job):
+    d = os.path.join(DL, job["id"])
+    os.makedirs(d, exist_ok=True)
+    try:
+        job["status"] = "downloading"
+        cmd = ["aria2c", "--dir=" + d, "--seed-time=0", "--summary-interval=2", "--console-log-level=warn", "--file-allocation=none",
+               "--max-connection-per-server=8", "--split=8", "--bt-max-peers=100", "--enable-dht=true", "--follow-torrent=true",
+               "--auto-file-renaming=false", "--allow-overwrite=true", "--bt-stop-timeout=900", job["link"]]
+        job["proc"] = p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        tail = []
+        for line in p.stdout:
+            tail = (tail + [line.strip()])[-4:]
+            m = re.search(r"\((\d+)%\)", line)
+            if m:
+                job["pct"] = int(m.group(1))
+            m = re.search(r"DL:(\S+?)[\s\]]", line)
+            if m:
+                job["speed"] = m.group(1) + "/s"
+            m = re.search(r"ETA:(\S+?)\]", line)
+            job["eta"] = m.group(1) if m else job.get("eta", "")
+        rc = p.wait()
+        job["proc"] = None
+        if job["cancel"]:
+            raise Cancelled()
+        if rc != 0:
+            raise RuntimeError("Download failed (aria2 code %d). %s" % (rc, " | ".join(tail)[:200]))
+        files = []
+        for root, _, names in os.walk(d):
+            for nme in names:
+                if nme.endswith((".aria2", ".torrent")):
+                    continue
+                fp = os.path.join(root, nme)
+                if os.path.getsize(fp) > 0:
+                    files.append(fp)
+        if not files:
+            raise RuntimeError("Nothing was downloaded.")
+        files.sort()
+        total = sum(os.path.getsize(f) for f in files)
+        job.update(status="uploading", pct=0, speed="", eta="", name=os.path.basename(files[0]) if len(files) == 1 else f"{len(files)} files")
+        done = 0
+        for fp in files:
+            done += put_file(fp, os.path.basename(fp), job, done, total)
+            os.remove(fp)   # free the disk as soon as each file is in the vault
+        job.update(status="done", pct=100, files=len(files), size=total)
+    except Cancelled:
+        job["status"] = "cancelled"
+    except Exception as e:
+        job["status"], job["error"] = "error", str(e)[:300]
+    finally:
+        job["proc"] = None
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def worker():
+    while True:
+        job = Q.get()
+        if job["cancel"]:
+            job["status"] = "cancelled"
+        else:
+            run(job)
+
+
+def need():
+    k = request.headers.get("X-Key", "")
+    if not secrets.compare_digest(k.encode(), os.environ.get("LEECH_KEY", "").encode() or b"\0"):
+        time.sleep(1)
+        abort(401)
+
+
+def pub(j):
+    return {k: j.get(k) for k in ("id", "name", "status", "pct", "speed", "eta", "error", "files", "size")}
+
+
+@app.post("/api/add")
+def add():
+    need()
+    link = str((request.get_json(silent=True) or {}).get("link", "")).strip()
+    if not (link.startswith("magnet:?") or re.match(r"https?://", link)):
+        return "Paste a magnet link or an http(s) link.", 400
+    job = {"id": secrets.token_hex(4), "link": link, "name": guess_name(link), "status": "queued", "pct": 0, "cancel": False}
+    with LOCK:
+        JOBS[job["id"]] = job
+        ORDER.insert(0, job["id"])
+        for old in ORDER[40:]:
+            JOBS.pop(old, None)
+        del ORDER[40:]
+    Q.put(job)
+    return jsonify(pub(job))
+
+
+@app.get("/api/jobs")
+def jobs():
+    need()
+    return jsonify([pub(JOBS[i]) for i in ORDER if i in JOBS])
+
+
+@app.post("/api/cancel/<jid>")
+def cancel(jid):
+    need()
+    j = JOBS.get(jid) or abort(404)
+    j["cancel"] = True
+    p = j.get("proc")
+    if p:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    return "", 204
+
+
+PAGE = """<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Vault leech</title>
+<style>:root{--bg:#0c121b;--p:#141d2a;--l:#243246;--t:#e7edf5;--m:#8796ab;--a:#6fd3c4;--r:#ff7a7a}*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--t);font:15px/1.5 system-ui,sans-serif}main{max-width:720px;margin:0 auto;padding:20px 16px 60px}
+h1{font:600 26px ui-serif,Georgia,serif;margin:6px 0 4px}p{color:var(--m);margin:0 0 18px}
+.b{background:var(--p);border:1px solid var(--l);border-radius:12px;padding:14px;margin-bottom:14px}
+input{width:100%;background:var(--bg);color:var(--t);border:1px solid var(--l);border-radius:8px;padding:11px;font:inherit}
+button{background:var(--a);color:#06201c;border:0;border-radius:8px;padding:10px 16px;font:600 14px inherit;cursor:pointer;margin-top:10px}
+button.g{background:none;color:var(--r);border:1px solid var(--l);margin:0;padding:6px 12px}
+.n{overflow-wrap:anywhere;font-weight:600}.s{color:var(--m);font-size:13px}.e{color:var(--r)}
+.bar{height:6px;background:var(--l);border-radius:3px;overflow:hidden;margin:8px 0 4px}.bar i{display:block;height:100%;background:var(--a);width:0}
+.j{display:flex;gap:10px;justify-content:space-between;align-items:flex-start}</style>
+<main><h1>Vault leech</h1><p>Paste a magnet or download link. The server downloads it and puts it straight into your vault.</p>
+<div class=b><input id=l placeholder="magnet:?xt=... or https://..." autocomplete=off><button id=add>Add</button><div id=m class=s style="margin-top:8px"></div></div>
+<div id=list></div></main>
+<script>
+const $=s=>document.querySelector(s);let K=localStorage.getItem('lk')||'';
+async function api(p,o={}){if(!K){K=prompt('Access key')||'';localStorage.setItem('lk',K)}
+const r=await fetch(p,{...o,headers:{'Content-Type':'application/json','X-Key':K}});
+if(r.status===401){localStorage.removeItem('lk');K='';throw new Error('Wrong access key')}
+if(!r.ok)throw new Error(await r.text());return r}
+const el=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e};
+const lab={queued:'Waiting',downloading:'Downloading',uploading:'Sending to vault',done:'Done, it is in your vault',error:'Failed',cancelled:'Cancelled'};
+async function load(){try{const js=await(await api('/api/jobs')).json(),box=$('#list');box.replaceChildren();
+for(const j of js){const b=el('div','b'),row=el('div','j'),left=el('div'),n=el('div','n',j.name);
+const act=['queued','downloading','uploading'].includes(j.status);
+const s=el('div','s'+(j.status==='error'?' e':''),(lab[j.status]||j.status)+(act&&j.status!=='queued'?' · '+j.pct+'%':'')+(j.speed?' · '+j.speed:'')+(j.eta?' · '+j.eta+' left':'')+(j.error?' · '+j.error:''));
+const bar=el('div','bar'),i=el('i');i.style.width=(j.status==='done'?100:j.pct||0)+'%';bar.append(i);left.append(n,bar,s);row.append(left);
+if(act){const c=el('button','g','Cancel');c.onclick=()=>api('/api/cancel/'+j.id,{method:'POST'}).then(load);row.append(c)}
+b.append(row);box.append(b)}}catch(e){$('#m').textContent=e.message}}
+$('#add').onclick=async()=>{const v=$('#l').value.trim();if(!v)return;try{await api('/api/add',{method:'POST',body:JSON.stringify({link:v})});$('#l').value='';$('#m').textContent='';load()}catch(e){$('#m').textContent=e.message}};
+$('#l').onkeydown=e=>{if(e.key==='Enter')$('#add').click()};
+load();setInterval(load,2500);
+</script></html>"""
+
+
+@app.get("/")
+def index():
+    return Response(PAGE, mimetype="text/html", headers={"Cache-Control": "no-store"})
+
+
+def main():
+    global AES
+    pw, key = os.environ.get("VAULT_PASSWORD"), os.environ.get("LEECH_KEY")
+    if not pw or not key or len(key) < 12:
+        sys.exit("Set VAULT_PASSWORD and LEECH_KEY (at least 12 characters) first. See the top of this file.")
+    if not shutil.which("aria2c"):
+        sys.exit("aria2 is not installed. On Debian/Ubuntu/Mint:  sudo apt install aria2")
+    AES = AESGCM(PBKDF2HMAC(hashes.SHA256(), 32, b"vault-v1", 300000).derive(pw.encode()))   # same key as the vault pages
+    os.makedirs(DL, exist_ok=True)
+    threading.Thread(target=worker, daemon=True).start()
+    print(f"\nVault leech running on port {PORT}. Open http://SERVER-IP:{PORT} and enter your access key.\n")
+    app.run(host="0.0.0.0", port=PORT, threaded=True)
+
+
+if __name__ == "__main__":
+    main()
