@@ -51,7 +51,9 @@ def put_file(path, name, job, base_done, total):
     size = os.path.getsize(path)
     n = max(1, -(-size // V.CHUNK))
     fid = secrets.token_hex(6)
-    meta = json.dumps({"name": name, "type": mimetypes.guess_type(name)[0] or "", "size": size, "t": int(time.time() * 1000)}).encode()
+    mime = mimetypes.guess_type(name)[0] or ""
+    folder = "Reels" if mime.startswith("video/") else ""
+    meta = json.dumps({"name": name, "folder": folder, "type": mime, "size": size, "t": int(time.time() * 1000)}).encode()
     send(f"v1 {fid} m {n}", f"m{fid}.bin", seal(meta))
     with open(path, "rb") as f:
         for i in range(n):
