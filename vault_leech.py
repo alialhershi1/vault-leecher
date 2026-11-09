@@ -77,7 +77,7 @@ def run(job):
     try:
         job["status"] = "downloading"
         cmd = ["aria2c", "--dir=" + d, "--seed-time=0", "--summary-interval=2",
-               "--console-log-level=notice", "--show-console-readout=true", "--console-readout-interval=2",
+               "--console-log-level=notice", "--show-console-readout=true",
                "--file-allocation=none", "--max-connection-per-server=8", "--split=8",
                "--bt-max-peers=100", "--enable-dht=true", "--enable-peer-exchange=true",
                "--bt-enable-lpd=true", "--bt-tracker-connect-timeout=15", "--bt-tracker-timeout=30",
