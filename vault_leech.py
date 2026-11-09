@@ -76,21 +76,44 @@ def run(job):
     os.makedirs(d, exist_ok=True)
     try:
         job["status"] = "downloading"
-        cmd = ["aria2c", "--dir=" + d, "--seed-time=0", "--summary-interval=2", "--console-log-level=warn", "--file-allocation=none",
-               "--max-connection-per-server=8", "--split=8", "--bt-max-peers=100", "--enable-dht=true", "--follow-torrent=true",
+        cmd = ["aria2c", "--dir=" + d, "--seed-time=0", "--summary-interval=2",
+               "--console-log-level=notice", "--show-console-readout=true", "--console-readout-interval=2",
+               "--file-allocation=none", "--max-connection-per-server=8", "--split=8",
+               "--bt-max-peers=100", "--enable-dht=true", "--enable-peer-exchange=true",
+               "--bt-enable-lpd=true", "--bt-tracker-connect-timeout=15", "--bt-tracker-timeout=30",
+               "--connect-timeout=15", "--timeout=60", "--follow-torrent=true",
                "--auto-file-renaming=false", "--allow-overwrite=true", "--bt-stop-timeout=900", job["link"]]
-        job["proc"] = p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-        tail = []
-        for line in p.stdout:
-            tail = (tail + [line.strip()])[-4:]
-            m = re.search(r"\((\d+)%\)", line)
+        # aria2 refreshes its progress display with carriage returns, not just newlines.
+        # Read both delimiters so progress and tracker/metadata diagnostics reach the UI.
+        job["proc"] = p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                           text=True, bufsize=1)
+        tail, line = [], ""
+        while True:
+            ch = p.stdout.read(1)
+            if ch == "":
+                if line.strip():
+                    tail = (tail + [line.strip()])[-8:]
+                break
+            if ch not in ("\\r", "\\n"):
+                line += ch
+                continue
+            if not line.strip():
+                line = ""
+                continue
+            entry, line = line.strip(), ""
+            tail = (tail + [entry])[-8:]
+            m = re.search(r"\\((\\d+)%\\)", entry)
             if m:
                 job["pct"] = int(m.group(1))
-            m = re.search(r"DL:(\S+?)[\s\]]", line)
+            m = re.search(r"DL:(\\S+?)(?:\\s|\\])", entry)
             if m:
                 job["speed"] = m.group(1) + "/s"
-            m = re.search(r"ETA:(\S+?)\]", line)
-            job["eta"] = m.group(1) if m else job.get("eta", "")
+            m = re.search(r"ETA:(\\S+?)\\]", entry)
+            if m:
+                job["eta"] = m.group(1)
+            # Keep the latest aria2 diagnostic visible if the torrent cannot find peers.
+            if any(word in entry.lower() for word in ("error", "failed", "no peers", "tracker")):
+                job["error"] = entry[:180]
         rc = p.wait()
         job["proc"] = None
         if job["cancel"]:
