@@ -95,6 +95,17 @@ def direct_download(url, folder):
     return [path]
 
 
+def folder_bytes(folder):
+    total = 0
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+        for filename in files:
+            path = os.path.join(root, filename)
+            if not os.path.islink(path) and os.path.isfile(path):
+                total += os.path.getsize(path)
+    return total
+
+
 def torrent_download(link, folder):
     if not link.startswith("magnet:?") or not re.search(r"xt=urn:bt(?:ih|mh):", link, re.I):
         raise ValueError("Use a valid magnet link containing a BitTorrent info hash.")
@@ -108,26 +119,37 @@ def torrent_download(link, folder):
         "--check-certificate=true", link
     ]
     print("Starting magnet download (authorized content only).", flush=True)
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    log_path = os.path.join(folder, ".aria2-job.log")
     started = time.time()
-    tail = []
+    with open(log_path, "w", encoding="utf-8", errors="replace") as log:
+        p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
+        try:
+            while p.poll() is None:
+                if time.time() - started > TIMEOUT:
+                    p.terminate()
+                    raise TimeoutError("Download exceeded the job time limit.")
+                if folder_bytes(folder) > MAX_BYTES:
+                    p.terminate()
+                    raise RuntimeError("Torrent exceeded MAX_DOWNLOAD_GB; download stopped.")
+                time.sleep(5)
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+        rc = p.returncode
     try:
-        for line in p.stdout:
-            line = line.rstrip()
-            if line:
-                tail = (tail + [line])[-8:]
-                if "DL:" in line or "ETA:" in line:
-                    print(line[:240], flush=True)
-            if time.time() - started > TIMEOUT:
-                p.terminate()
-                raise TimeoutError("Download exceeded the job time limit.")
-        rc = p.wait()
+        with open(log_path, "r", encoding="utf-8", errors="replace") as log:
+            tail = log.readlines()[-8:]
+        for line in tail:
+            if "DL:" in line or "ETA:" in line:
+                print(line.strip()[:240], flush=True)
     finally:
-        if p.poll() is None:
-            p.kill()
-            p.wait()
+        try:
+            os.remove(log_path)
+        except OSError:
+            pass
     if rc:
-        raise RuntimeError("aria2 download failed: " + " | ".join(tail)[-500:])
+        raise RuntimeError("aria2 download failed: " + " | ".join(x.strip() for x in tail)[-500:])
     paths = []
     for root, dirs, files in os.walk(folder):
         dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
