@@ -94,7 +94,7 @@ def run(job):
                 if line.strip():
                     tail = (tail + [line.strip()])[-8:]
                 break
-            if ch not in ("\\r", "\\n"):
+            if ch not in ("\r", "\n"):
                 line += ch
                 continue
             if not line.strip():
@@ -102,13 +102,13 @@ def run(job):
                 continue
             entry, line = line.strip(), ""
             tail = (tail + [entry])[-8:]
-            m = re.search(r"\\((\\d+)%\\)", entry)
+            m = re.search(r"\((\d+)%\)", entry)
             if m:
                 job["pct"] = int(m.group(1))
-            m = re.search(r"DL:(\\S+?)(?:\\s|\\])", entry)
+            m = re.search(r"DL:(\S+?)(?:\s|\])", entry)
             if m:
                 job["speed"] = m.group(1) + "/s"
-            m = re.search(r"ETA:(\\S+?)\\]", entry)
+            m = re.search(r"ETA:(\S+?)\]", entry)
             if m:
                 job["eta"] = m.group(1)
             # Keep the latest aria2 diagnostic visible if the torrent cannot find peers.
