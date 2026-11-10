@@ -53,14 +53,18 @@ def put_file(path, name, job, base_done, total):
     fid = secrets.token_hex(6)
     mime = mimetypes.guess_type(name)[0] or ""
     meta = json.dumps({"name": name, "type": mime, "size": size, "t": int(time.time() * 1000)}).encode()
-    send(f"v1 {fid} m {n}", f"m{fid}.bin", seal(meta))
+    # Upload all encrypted chunks first. The metadata message is the final
+    # commit marker, so the vault never indexes a partially uploaded file.
     with open(path, "rb") as f:
         for i in range(n):
             if job["cancel"]:
                 raise Cancelled()
             data = f.read(V.CHUNK)
+            if not data:
+                raise RuntimeError("The downloaded file ended before all chunks were read.")
             send(f"v1 {fid} c{i} {n}", f"{fid}.{i}.bin", seal(data))
             job["pct"] = round(100 * (base_done + min(size, (i + 1) * V.CHUNK)) / max(1, total))
+    send(f"v1 {fid} m {n}", f"m{fid}.bin", seal(meta))
     return size
 
 
