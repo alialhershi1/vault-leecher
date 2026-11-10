@@ -26,6 +26,13 @@ AES = None
 JOBS, ORDER, Q = {}, [], queue.Queue()
 LOCK = threading.Lock()
 
+# Social-video downloads use their own queue, worker, and temporary folders.
+# They never occupy the magnet worker or alter its queue.
+SOCIAL_JOBS, SOCIAL_ORDER, SOCIAL_Q = {}, [], queue.Queue()
+SOCIAL_LOCK = threading.Lock()
+SOCIAL_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
+                "instagram.com", "www.instagram.com"}
+
 
 class Cancelled(Exception):
     pass
@@ -160,6 +167,87 @@ def worker():
             run(job)
 
 
+
+def social_host_ok(link):
+    try:
+        u = urlparse(link)
+        host = (u.hostname or "").lower()
+        return u.scheme == "https" and host in SOCIAL_HOSTS
+    except Exception:
+        return False
+
+
+def run_social(job):
+    d = os.path.join(DL, "social_" + job["id"])
+    os.makedirs(d, exist_ok=True)
+    try:
+        job["status"] = "downloading"
+        # Public/accessible single videos only: no playlist expansion, cookies,
+        # login automation, or access-control bypass.
+        template = os.path.join(d, "%(title).150B.%(ext)s")
+        cmd = ["yt-dlp", "--no-playlist", "--max-downloads", "1",
+               "--newline", "--progress", "--no-warnings",
+               "--format", "best[ext=mp4]/best",
+               "--output", template, job["link"]]
+        job["proc"] = p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                           stderr=subprocess.STDOUT, text=True,
+                                           bufsize=1)
+        tail = []
+        for entry in p.stdout:
+            if job["cancel"]:
+                p.terminate()
+                raise Cancelled()
+            entry = entry.strip()
+            if not entry:
+                continue
+            tail = (tail + [entry])[-8:]
+            m = re.search(r"(\\d+(?:\\.\\d+)?)%", entry)
+            if m:
+                job["pct"] = min(99, int(float(m.group(1))))
+            m = re.search(r" at (\\S+)", entry)
+            if m:
+                job["speed"] = m.group(1)
+            m = re.search(r"ETA (\\S+)", entry)
+            if m:
+                job["eta"] = m.group(1)
+        rc = p.wait()
+        job["proc"] = None
+        if job["cancel"]:
+            raise Cancelled()
+        if rc != 0:
+            raise RuntimeError("Social video download failed. " + " | ".join(tail)[-220:])
+        files = []
+        for root, _, names in os.walk(d):
+            for nme in names:
+                fp = os.path.join(root, nme)
+                if os.path.isfile(fp) and os.path.getsize(fp) > 0 and not nme.endswith((".part", ".ytdl")):
+                    files.append(fp)
+        if not files:
+            raise RuntimeError("No video file was produced. The post may be private, unavailable, or require sign-in.")
+        files.sort(key=lambda x: os.path.getsize(x), reverse=True)
+        fp = files[0]
+        total = os.path.getsize(fp)
+        job.update(status="uploading", pct=0, speed="", eta="", name=os.path.basename(fp))
+        put_file(fp, os.path.basename(fp), job, 0, total)
+        job.update(status="done", pct=100, files=1, size=total)
+    except Cancelled:
+        job["status"] = "cancelled"
+    except Exception as e:
+        job["status"], job["error"] = "error", str(e)[:300]
+    finally:
+        job["proc"] = None
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def social_worker():
+    while True:
+        job = SOCIAL_Q.get()
+        if job["cancel"]:
+            job["status"] = "cancelled"
+        else:
+            run_social(job)
+
+
 def need():
     k = request.headers.get("X-Key", "")
     if not secrets.compare_digest(k.encode(), os.environ.get("LEECH_KEY", "").encode() or b"\0"):
@@ -186,6 +274,45 @@ def add():
         del ORDER[40:]
     Q.put(job)
     return jsonify(pub(job))
+
+
+
+@app.post("/api/social/add")
+def add_social():
+    need()
+    link = str((request.get_json(silent=True) or {}).get("link", "")).strip()
+    if not social_host_ok(link):
+        return "Use an HTTPS YouTube or Instagram video URL.", 400
+    job = {"id": secrets.token_hex(4), "link": link, "name": "Social video",
+           "status": "queued", "pct": 0, "cancel": False}
+    with SOCIAL_LOCK:
+        SOCIAL_JOBS[job["id"]] = job
+        SOCIAL_ORDER.insert(0, job["id"])
+        for old in SOCIAL_ORDER[40:]:
+            SOCIAL_JOBS.pop(old, None)
+        del SOCIAL_ORDER[40:]
+    SOCIAL_Q.put(job)
+    return jsonify(pub(job))
+
+
+@app.get("/api/social/jobs")
+def social_jobs():
+    need()
+    return jsonify([pub(SOCIAL_JOBS[i]) for i in SOCIAL_ORDER if i in SOCIAL_JOBS])
+
+
+@app.post("/api/social/cancel/<jid>")
+def cancel_social(jid):
+    need()
+    j = SOCIAL_JOBS.get(jid) or abort(404)
+    j["cancel"] = True
+    p = j.get("proc")
+    if p:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    return "", 204
 
 
 @app.get("/api/jobs")
@@ -221,7 +348,11 @@ button.g{background:none;color:var(--r);border:1px solid var(--l);margin:0;paddi
 .j{display:flex;gap:10px;justify-content:space-between;align-items:flex-start}</style>
 <main><h1>Vault leech</h1><p>Paste a magnet or download link. The server downloads it and puts it straight into your vault.</p>
 <div class=b><input id=l placeholder="magnet:?xt=... or https://..." autocomplete=off><button id=add>Add</button><div id=m class=s style="margin-top:8px"></div></div>
-<div id=list></div></main>
+<div id=list></div>
+<h2 style="font-size:19px;margin:26px 0 8px">YouTube / Instagram</h2>
+<p>Paste a public video link you own or have permission to save. This runs separately from magnet downloads.</p>
+<div class=b><input id=socialLink placeholder="https://youtu.be/... or https://www.instagram.com/reel/..." autocomplete=off><button id=socialAdd>Download video</button><div id=socialMsg class=s style="margin-top:8px"></div></div>
+<div id=socialList></div></main>
 <script>
 const $=s=>document.querySelector(s);let K=localStorage.getItem('lk')||'';
 async function api(p,o={}){if(!K){K=prompt('Access key')||'';localStorage.setItem('lk',K)}
@@ -237,9 +368,19 @@ const s=el('div','s'+(j.status==='error'?' e':''),(lab[j.status]||j.status)+(act
 const bar=el('div','bar'),i=el('i');i.style.width=(j.status==='done'?100:j.pct||0)+'%';bar.append(i);left.append(n,bar,s);row.append(left);
 if(act){const c=el('button','g','Cancel');c.onclick=()=>api('/api/cancel/'+j.id,{method:'POST'}).then(load);row.append(c)}
 b.append(row);box.append(b)}}catch(e){$('#m').textContent=e.message}}
+
+async function loadSocial(){try{const js=await(await api('/api/social/jobs')).json(),box=$('#socialList');box.replaceChildren();
+for(const j of js){const b=el('div','b'),row=el('div','j'),left=el('div'),n=el('div','n',j.name);
+const act=['queued','downloading','uploading'].includes(j.status);
+const s=el('div','s'+(j.status==='error'?' e':''),(lab[j.status]||j.status)+(act&&j.status!=='queued'?' · '+j.pct+'%':'')+(j.speed?' · '+j.speed:'')+(j.eta?' · '+j.eta+' left':'')+(j.error?' · '+j.error:''));
+const bar=el('div','bar'),i=el('i');i.style.width=(j.status==='done'?100:j.pct||0)+'%';bar.append(i);left.append(n,bar,s);row.append(left);
+if(act){const c=el('button','g','Cancel');c.onclick=()=>api('/api/social/cancel/'+j.id,{method:'POST'}).then(loadSocial);row.append(c)}
+b.append(row);box.append(b)}}catch(e){$('#socialMsg').textContent=e.message}}
+$('#socialAdd').onclick=async()=>{const v=$('#socialLink').value.trim();if(!v)return;try{await api('/api/social/add',{method:'POST',body:JSON.stringify({link:v})});$('#socialLink').value='';$('#socialMsg').textContent='';loadSocial()}catch(e){$('#socialMsg').textContent=e.message}};
+$('#socialLink').onkeydown=e=>{if(e.key==='Enter')$('#socialAdd').click()};
 $('#add').onclick=async()=>{const v=$('#l').value.trim();if(!v)return;try{await api('/api/add',{method:'POST',body:JSON.stringify({link:v})});$('#l').value='';$('#m').textContent='';load()}catch(e){$('#m').textContent=e.message}};
 $('#l').onkeydown=e=>{if(e.key==='Enter')$('#add').click()};
-load();setInterval(load,2500);
+load();loadSocial();setInterval(()=>{load();loadSocial()},2500);
 </script></html>"""
 
 
@@ -257,7 +398,10 @@ def main():
         sys.exit("aria2 is not installed. On Debian/Ubuntu/Mint:  sudo apt install aria2")
     AES = AESGCM(PBKDF2HMAC(hashes.SHA256(), 32, b"vault-v1", 300000).derive(pw.encode()))   # same key as the vault pages
     os.makedirs(DL, exist_ok=True)
+    if not shutil.which("yt-dlp"):
+        sys.exit("yt-dlp is not installed. Rebuild the Docker image.")
     threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=social_worker, daemon=True).start()
     print(f"\nVault leech running on port {PORT}. Open http://SERVER-IP:{PORT} and enter your access key.\n")
     app.run(host="0.0.0.0", port=PORT, threaded=True)
 
