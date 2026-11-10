@@ -152,7 +152,7 @@ def run(job):
     except Cancelled:
         job["status"] = "cancelled"
     except Exception as e:
-        job["status"], job["error"] = "error", str(e)[:300]
+        job["status"], job["error"] = "error", str(e)[:1100]
     finally:
         job["proc"] = None
         shutil.rmtree(d, ignore_errors=True)
@@ -192,7 +192,9 @@ def run_social(job):
         # Public/accessible single videos only: no playlist expansion, cookies,
         # login automation, or access-control bypass.
         template = os.path.join(d, "%(title).150B.%(ext)s")
-        cmd = ["yt-dlp", "--js-runtimes", "deno", "--no-playlist", "--max-downloads", "1",
+        cmd = ["yt-dlp", "--js-runtimes", "deno", "--extractor-args",
+               "youtube:player_client=web_safari,tv_samsung", "--verbose",
+               "--no-playlist", "--max-downloads", "1",
                "--newline", "--progress", "--no-warnings",
                "--format", "best[ext=mp4]/best",
                "--output", template, job["link"]]
@@ -222,7 +224,7 @@ def run_social(job):
         if job["cancel"]:
             raise Cancelled()
         if rc != 0:
-            raise RuntimeError("Social video download failed. " + " | ".join(tail)[-220:])
+            raise RuntimeError("Social video download failed. " + " | ".join(tail)[-1000:])
         files = []
         for root, _, names in os.walk(d):
             for nme in names:
