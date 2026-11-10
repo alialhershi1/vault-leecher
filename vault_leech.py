@@ -192,8 +192,9 @@ def run_social(job):
         # Public/accessible single videos only: no playlist expansion, cookies,
         # login automation, or access-control bypass.
         template = os.path.join(d, "%(title).150B.%(ext)s")
-        cmd = ["yt-dlp", "--js-runtimes", "deno", "--extractor-args",
-               "youtube:player_client=web_safari,tv_samsung", "--verbose",
+        cmd = ["yt-dlp", "--js-runtimes", "deno",
+               "--extractor-retries", "3", "--retry-sleep", "extractor:2",
+               "--socket-timeout", "20", "--verbose",
                "--no-playlist", "--max-downloads", "1",
                "--newline", "--progress", "--no-warnings",
                "--format", "best[ext=mp4]/best",
