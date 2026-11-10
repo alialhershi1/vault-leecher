@@ -112,7 +112,7 @@ def run(job):
                 line = ""
                 continue
             entry, line = line.strip(), ""
-            tail = (tail + [entry])[-8:]
+            tail = (tail + [entry])[-16:]
             m = re.search(r"\((\d+)%\)", entry)
             if m:
                 job["pct"] = int(m.group(1))
@@ -243,7 +243,7 @@ def run_social(job):
     except Cancelled:
         job["status"] = "cancelled"
     except Exception as e:
-        job["status"], job["error"] = "error", str(e)[:300]
+        job["status"], job["error"] = "error", str(e)[:1200]
     finally:
         job["proc"] = None
         shutil.rmtree(d, ignore_errors=True)
