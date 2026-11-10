@@ -172,7 +172,14 @@ def social_host_ok(link):
     try:
         u = urlparse(link)
         host = (u.hostname or "").lower()
-        return u.scheme == "https" and host in SOCIAL_HOSTS
+        path = u.path.lower()
+        if u.scheme != "https" or host not in SOCIAL_HOSTS:
+            return False
+        if host.endswith("youtube.com"):
+            return path == "/watch" or path.startswith(("/shorts/", "/live/", "/embed/"))
+        if host == "youtu.be":
+            return len(path.strip("/")) > 0
+        return path.startswith(("/reel/", "/reels/", "/p/", "/tv/"))
     except Exception:
         return False
 
@@ -201,13 +208,13 @@ def run_social(job):
             if not entry:
                 continue
             tail = (tail + [entry])[-8:]
-            m = re.search(r"(\\d+(?:\\.\\d+)?)%", entry)
+            m = re.search(r"(\d+(?:\.\d+)?)%", entry)
             if m:
                 job["pct"] = min(99, int(float(m.group(1))))
-            m = re.search(r" at (\\S+)", entry)
+            m = re.search(r" at (\S+)", entry)
             if m:
                 job["speed"] = m.group(1)
-            m = re.search(r"ETA (\\S+)", entry)
+            m = re.search(r"ETA (\S+)", entry)
             if m:
                 job["eta"] = m.group(1)
         rc = p.wait()
