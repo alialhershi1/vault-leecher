@@ -192,7 +192,7 @@ def run_social(job):
         # Public/accessible single videos only: no playlist expansion, cookies,
         # login automation, or access-control bypass.
         template = os.path.join(d, "%(title).150B.%(ext)s")
-        cmd = ["yt-dlp", "--no-playlist", "--max-downloads", "1",
+        cmd = ["yt-dlp", "--js-runtimes", "deno", "--no-playlist", "--max-downloads", "1",
                "--newline", "--progress", "--no-warnings",
                "--format", "best[ext=mp4]/best",
                "--output", template, job["link"]]
