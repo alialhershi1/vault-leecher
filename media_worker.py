@@ -7,7 +7,6 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 
 app = Flask(__name__)
-MAX_BYTES = int(os.getenv("MAX_DOWNLOAD_BYTES", str(500 * 1024 * 1024)))
 CHUNK = 9 * 1024 * 1024
 jobs, order, q = {}, [], queue.Queue()
 lock = threading.Lock()
@@ -71,8 +70,6 @@ def process(j):
                 raise ValueError("Redirects are disabled. Use the final HTTPS download URL.")
             r.raise_for_status()
             length = int(r.headers.get("Content-Length") or 0)
-            if length > MAX_BYTES:
-                raise ValueError(f"File exceeds the {MAX_BYTES//(1024*1024)} MiB limit.")
             name = unquote(os.path.basename(u.path)) or "download.bin"
             name = re.sub(r"[^A-Za-z0-9._ -]", "_", name)[:120] or "download.bin"
             total = 0
@@ -81,7 +78,6 @@ def process(j):
                 for block in r.iter_content(256*1024):
                     if not block: continue
                     total += len(block)
-                    if total > MAX_BYTES: raise ValueError("Download exceeded the configured size limit.")
                     f.write(block)
                     j["pct"] = min(95, int(total*95/max(1,length))) if length else 0
         if total <= 0: raise ValueError("The URL returned an empty file.")
@@ -150,7 +146,7 @@ button{padding:11px 17px;border:0;border-radius:9px;background:#79d6c3;color:#06
 </style></head><body><main><h1>Vault Media</h1><p>Send a direct HTTPS download that you own or are authorized to save. The worker transfers it into your encrypted Discord Vault.</p>
 <div class=panel><input id=key type=password placeholder='Worker access key' autocomplete=off><br><br>
 <input id=url placeholder='https://… direct file URL' autocomplete=off><button id=add>Download to Vault</button>
-<p class=small id=msg>Maximum file size: """ + str(MAX_BYTES//(1024*1024)) + """ MiB. Public HTTPS hosts only; redirects and private network addresses are blocked.</p></div><div id=jobs></div></main>
+<p class=small id=msg>No application-level file-size limit. Public HTTPS hosts only; redirects and private network addresses are blocked.</p></div><div id=jobs></div></main>
 <script>
 const $=s=>document.querySelector(s);let key='';
 async function api(path,opts={}){key=$('#key').value;const r=await fetch(path,{...opts,headers:{'Content-Type':'application/json','X-Key':key}});if(!r.ok)throw Error(await r.text());return r}
