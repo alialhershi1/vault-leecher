@@ -151,10 +151,22 @@ def source_archive():
         for d in docs:
             ident=d.get("identifier","")
             if not ident: continue
+            page="https://archive.org/details/"+ident
+            direct=""
+            try:
+                mr=requests.get("https://archive.org/metadata/"+ident,timeout=12,
+                               headers={"User-Agent":"VaultMediaWorker/1.0"})
+                mr.raise_for_status()
+                files=mr.json().get("files",[])
+                candidates=[x for x in files if str(x.get("name","")).lower().endswith((".mp4",".m4v"))]
+                if candidates:
+                    fn=candidates[0].get("name","")
+                    direct="https://archive.org/download/"+ident+"/"+requests.utils.requote_uri(fn)
+            except Exception:
+                pass
             out.append({"title":d.get("title") or ident,"year":d.get("year"),
                         "license":d.get("licenseurl") or "Rights not specified — verify before downloading",
-                        "url":"https://archive.org/details/"+ident,
-                        "identifier":ident})
+                        "url":direct,"page":page,"identifier":ident})
         return jsonify(results=out)
     except Exception:
         return jsonify(error="Archive search is temporarily unavailable.",results=[]),502
@@ -237,7 +249,7 @@ document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.query
 async function api(path,opts={}){const r=await fetch(path,{...opts,headers:{'Content-Type':'application/json','X-Key':$('#key').value}});if(!r.ok)throw Error(await r.text());return r}
 function card(item,kind){const d=document.createElement('div');d.className='result';const n=document.createElement('div');n.className='name';n.textContent=item.title||item.name;const p=document.createElement('p');p.className='small';p.textContent=(item.year||'')+' · '+(item.license||item.language||'')+(item.release?' · '+item.release:'');const a=document.createElement('a');a.href=item.page||item.url;a.target='_blank';a.rel='noopener';a.textContent='Open source / details';d.append(n,p,a);
 if(kind==='file'&&item.url){const b=document.createElement('button');b.textContent='Use direct file';b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x.dataset.tab==='transfer'));['sources','subs','transfer'].forEach(id=>$('#'+id).classList.toggle('hidden',id!=='transfer'));$('#url').value=item.url;};d.append(b)}return d}
-$('#search').onclick=async()=>{const q= $('#sq').value.trim(),box=$('#sourceResults');box.replaceChildren();if(!q)return;box.textContent='Searching…';try{const [a,w]=await Promise.all([fetch('/api/source/archive?q='+encodeURIComponent(q)).then(r=>r.json()),fetch('/api/source/commons?q='+encodeURIComponent(q)).then(r=>r.json())]);box.replaceChildren();for(const x of (a.results||[])){const d=card(x,'page');box.append(d)}for(const x of (w.results||[])){const d=card(x,'file');box.append(d)}if(!box.children.length)box.textContent=a.error||w.error||'No results found.'}catch(e){box.textContent=e.message}};
+$('#search').onclick=async()=>{const q= $('#sq').value.trim(),box=$('#sourceResults');box.replaceChildren();if(!q)return;box.textContent='Searching…';try{const [a,w]=await Promise.all([fetch('/api/source/archive?q='+encodeURIComponent(q)).then(r=>r.json()),fetch('/api/source/commons?q='+encodeURIComponent(q)).then(r=>r.json())]);box.replaceChildren();for(const x of (a.results||[])){const d=card(x,x.url?'file':'page');box.append(d)}for(const x of (w.results||[])){const d=card(x,'file');box.append(d)}if(!box.children.length)box.textContent=a.error||w.error||'No results found.'}catch(e){box.textContent=e.message}};
 $('#subsearch').onclick=async()=>{const box=$('#subResults');box.textContent='Searching…';try{const d=await(await fetch('/api/subtitles?q='+encodeURIComponent($('#subq').value)+'&lang='+$('#lang').value)).json();box.replaceChildren();if(d.error){box.textContent=d.error;return}for(const x of d.results||[])box.append(card(x,'page'));if(!box.children.length)box.textContent='No subtitles found.'}catch(e){box.textContent=e.message}};
 $('#add').onclick=async()=>{try{await api('/api/add',{method:'POST',body:JSON.stringify({url:$('#url').value.trim()})});$('#url').value='';$('#msg').textContent='Queued.';load()}catch(e){$('#msg').textContent=e.message;$('#msg').className='small error'}};
 async function load(){if(!$('#key').value)return;try{const data=await(await api('/api/jobs')).json(),box=$('#jobs');box.replaceChildren();for(const j of data){const d=document.createElement('div');d.className='job';const n=document.createElement('div');n.className='name';n.textContent=j.name||'Download';const s=document.createElement('div');s.className='small'+(j.error?' error':'');s.textContent=j.status+' · '+(j.pct||0)+'%'+(j.error?' · '+j.error:'');const b=document.createElement('div');b.className='bar';const v=document.createElement('span');v.style.width=(j.pct||0)+'%';b.append(v);d.append(n,b,s);box.append(d)}}catch(e){}}
