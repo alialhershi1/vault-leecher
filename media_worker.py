@@ -6,6 +6,7 @@ from flask import Flask, request, jsonify, Response, abort, session, redirect
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
+from media_providers import get_provider, public_providers, ProviderError
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SESSION_SECRET") or os.environ.get("LEECH_KEY", "change-this-session-secret")
@@ -200,6 +201,36 @@ def _ia_metadata(identifier):
     if str(metadata.get("access-restricted-item", "")).lower() in ("true", "1", "yes"):
         raise ValueError("This archive item is access restricted.")
     return data, metadata, license_url
+
+
+@app.get("/api/providers")
+def providers_list():
+    auth()
+    return jsonify(providers=public_providers())
+
+
+@app.get("/api/providers/<provider_id>/search")
+def provider_search(provider_id):
+    auth()
+    try:
+        provider = get_provider(provider_id)
+        return jsonify(items=provider.search(request.args.get("q", "").strip()[:100]))
+    except ProviderError as exc:
+        return jsonify(error=str(exc), items=[]), 400
+    except Exception:
+        return jsonify(error="The selected catalogue is temporarily unavailable.", items=[]), 502
+
+
+@app.get("/api/providers/<provider_id>/item/<identifier>")
+def provider_item(provider_id, identifier):
+    auth()
+    try:
+        provider = get_provider(provider_id)
+        return jsonify(provider.item(identifier))
+    except ProviderError as exc:
+        return jsonify(error=str(exc)), 403
+    except Exception:
+        return jsonify(error="Could not load this catalogue item."), 502
 
 
 @app.get("/api/movies/search")
@@ -412,7 +443,7 @@ a{color:#79d6c3;overflow-wrap:anywhere}.result{margin:9px 0}.hidden{display:none
 <div><button class='tab active' data-tab='sources'>Movies &amp; Series</button><button class=tab data-tab='subs'>Subtitles</button><button class=tab data-tab='transfer'>Direct transfer</button></div>
 <section id=sources>
 <div class=panel><h2>Browse openly licensed movies &amp; series</h2><p class=small>Search verified Creative Commons catalogue entries. Open a title to see its available video files and any archive torrent file.</p>
-<input id=movieQuery placeholder='Search movie or series title'><button id=movieSearch>Search</button><div id=movieResults></div>
+<select id=providerSelect aria-label='Media catalogue'><option value='archive_cc'>Source 1 · Internet Archive (Creative Commons)</option><option value='source_2' disabled>Source 2 · Reserved</option></select><input id=movieQuery placeholder='Search movie or series title'><button id=movieSearch>Search</button><div id=providerStatus class=small>Source 1 · openly licensed catalogue</div><div id=movieResults></div>
 <div id=movieDetail></div>
 </div>
 <div class=panel><h2>Magnet link</h2><p class=small>For a magnet link to content you are authorized to download, paste it here. The existing torrent server downloads it and uploads the files into your Vault.</p>
@@ -437,9 +468,9 @@ if(kind==='file'&&item.url){const b=document.createElement('button');b.textConte
 function fmtSize(n){n=Number(n)||0;for(const u of ['B','KB','MB','GB','TB']){if(n<1024||u==='TB')return (u==='B'?Math.round(n):n.toFixed(1))+' '+u;n/=1024}}
 function safeText(el,tag,cls,value){const x=document.createElement(tag);if(cls)x.className=cls;x.textContent=value||'';el.append(x);return x}
 async function findMovies(){const q=$('#movieQuery').value.trim(),box=$('#movieResults');$('#movieDetail').replaceChildren();box.textContent='Searching…';if(!q){box.textContent='Enter a title.';return}
-try{const d=await(await api('/api/movies/search?q='+encodeURIComponent(q))).json();if(d.error)throw Error(d.error);box.replaceChildren();if(!(d.items||[]).length){box.textContent='No clearly licensed matches found. Try another title.';return}
+try{const provider=$('#providerSelect').value;const d=await(await api('/api/providers/'+encodeURIComponent(provider)+'/search?q='+encodeURIComponent(q))).json();if(d.error)throw Error(d.error);box.replaceChildren();if(!(d.items||[]).length){box.textContent='No clearly licensed matches found. Try another title.';return}
 for(const it of d.items){const card=document.createElement('div');card.className='result';const row=document.createElement('div');row.style.cssText='display:flex;gap:12px;align-items:flex-start';const img=document.createElement('img');img.src=it.poster;img.alt='';img.loading='lazy';img.style.cssText='width:76px;height:108px;object-fit:cover;border-radius:8px;background:#0b111b';const info=document.createElement('div');info.style.minWidth='0';safeText(info,'div','name',it.title);safeText(info,'div','small',(it.year||'')+(it.creator?' · '+it.creator:''));safeText(info,'div','small','Creative Commons licence');const b=document.createElement('button');b.textContent='Show sources';b.onclick=()=>openMovie(it.id);info.append(b);row.append(img,info);card.append(row);box.append(card)}}catch(e){box.textContent=e.message}}
-async function openMovie(id){const box=$('#movieDetail');box.textContent='Loading source files…';try{const d=await(await api('/api/movies/item/'+encodeURIComponent(id))).json();if(!d.item)throw Error(d.error||'Could not load title');box.replaceChildren();const panel=document.createElement('div');panel.className='result';safeText(panel,'div','name',d.item.title+' · '+(d.item.year||''));safeText(panel,'p','small',d.item.description||'No description supplied.');const lic=document.createElement('a');lic.href=d.item.license;lic.target='_blank';lic.rel='noopener';lic.textContent='View Creative Commons licence';panel.append(lic);safeText(panel,'h3','', 'Available files');if(!d.files.length)safeText(panel,'p','small','No video or torrent files are listed for this item.');
+async function openMovie(id){const box=$('#movieDetail');box.textContent='Loading source files…';try{const provider=$('#providerSelect').value;const d=await(await api('/api/providers/'+encodeURIComponent(provider)+'/item/'+encodeURIComponent(id))).json();if(!d.item)throw Error(d.error||'Could not load title');box.replaceChildren();const panel=document.createElement('div');panel.className='result';safeText(panel,'div','name',d.item.title+' · '+(d.item.year||''));safeText(panel,'p','small',d.item.description||'No description supplied.');const lic=document.createElement('a');lic.href=d.item.license;lic.target='_blank';lic.rel='noopener';lic.textContent='View Creative Commons licence';panel.append(lic);safeText(panel,'h3','', 'Available files');if(!d.files.length)safeText(panel,'p','small','No video or torrent files are listed for this item.');
 for(const f of d.files){const row=document.createElement('div');row.className='result';const title=document.createElement('div');title.className='name';title.textContent=f.name;const detail=document.createElement('div');detail.className='small';detail.textContent=(f.kind==='torrent'?'Archive torrent':'Video file')+' · '+fmtSize(f.size)+(f.format?' · '+f.format:'');const b=document.createElement('button');b.textContent=f.kind==='torrent'?'Download via torrent server':'Download to Vault';b.onclick=async()=>{b.disabled=true;try{const r=await api('/api/movies/download',{method:'POST',body:JSON.stringify({id,filename:f.name,kind:f.kind})});const result=await r.json();if(!r.ok)throw Error(result.error||'Could not queue this source');b.textContent=result.mode==='torrent'?'Torrent queued':'Queued for Vault';load();loadTorrentJobs()}catch(e){b.disabled=false;detail.textContent=e.message}};row.append(title,detail,b);panel.append(row)}
 box.append(panel)}catch(e){box.textContent=e.message}}
 async function addMagnet(){const link=$('#magnetInput').value.trim(),status=$('#magnetStatus');if(!link)return;try{const r=await api('/api/torrents/add',{method:'POST',body:JSON.stringify({link,authorized:$('#magnetAuthorized').checked})});const d=await r.json();if(!r.ok)throw Error(d.error||'Could not queue magnet');$('#magnetInput').value='';status.textContent='Torrent queued on the server.';loadTorrentJobs()}catch(e){status.textContent=e.message}}
