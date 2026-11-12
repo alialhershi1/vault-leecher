@@ -158,7 +158,4 @@ $('#add').onclick=async()=>{try{await api('/api/add',{method:'POST',body:JSON.st
 async function load(){if(!$('#key').value)return;try{const data=await(await api('/api/jobs')).json(),box=$('#jobs');box.replaceChildren();for(const j of data){const d=document.createElement('div');d.className='job';const n=document.createElement('div');n.className='name';n.textContent=j.name||'Download';const s=document.createElement('div');s.className='small'+(j.error?' error':'');s.textContent=j.status+' · '+(j.pct||0)+'%'+(j.error?' · '+j.error:'');const b=document.createElement('div');b.className='bar';const v=document.createElement('span');v.style.width=(j.pct||0)+'%';b.append(v);d.append(n,b,s);box.append(d)}}catch(e){$('#msg').textContent=e.message}}
 setInterval(load,2500);</script></body></html>"""
 
-if __name__ == "__main__":
-    config()
-    threading.Thread(target=worker,daemon=True).start()
-    app.run(host="0.0.0.0",port=int(os.getenv("PORT","10000")),threaded=True)
+threading.Thread(target=worker,daemon=True).start()
