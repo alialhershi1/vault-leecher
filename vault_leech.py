@@ -399,20 +399,71 @@ def index():
     return Response(PAGE, mimetype="text/html", headers={"Cache-Control": "no-store"})
 
 
+def validate_pc_vault_contract(password):
+    """Fail early unless this uploader matches the PC Vault v1 storage contract."""
+    expected_chunk = 9 * 1024 * 1024
+    if getattr(V, "CHUNK", None) != expected_chunk:
+        raise RuntimeError(
+            "Vault format mismatch: the PC Vault requires 9 MiB chunks. "
+            "Check vault_server.py; no files have been uploaded."
+        )
+    if not getattr(V, "CH", ""):
+        raise RuntimeError(
+            "Discord vault channel is not configured. Set DISCORD_TOKEN and "
+            "DISCORD_CHANNEL in Render (or configure vault_server.py)."
+        )
+    auth = V.S.headers.get("Authorization", "")
+    if not auth.startswith("Bot "):
+        raise RuntimeError(
+            "Discord bot token is not configured. Set DISCORD_TOKEN in Render."
+        )
+
+    # Verify the exact PC Vault key derivation and AES-GCM envelope locally.
+    key = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"vault-v1",
+        iterations=300000,
+    ).derive(password.encode())
+    probe = AESGCM(key)
+    nonce = os.urandom(12)
+    sample = b"PC Vault v1 compatibility check"
+    encrypted = nonce + probe.encrypt(nonce, sample, None)
+    if probe.decrypt(encrypted[:12], encrypted[12:], None) != sample:
+        raise RuntimeError("PC Vault encryption compatibility check failed.")
+
+    # Confirm that the configured bot can actually access the selected channel.
+    channel = V.dc("GET", f"/channels/{V.CH}").json()
+    if str(channel.get("id", "")) != str(V.CH):
+        raise RuntimeError(
+            "Discord did not confirm the configured vault channel. "
+            "Check DISCORD_TOKEN and DISCORD_CHANNEL."
+        )
+    return AESGCM(key)
+
+
 def main():
     global AES
     pw, key = os.environ.get("VAULT_PASSWORD"), os.environ.get("LEECH_KEY")
     if not pw or not key or len(key) < 12:
         sys.exit("Set VAULT_PASSWORD and LEECH_KEY (at least 12 characters) first. See the top of this file.")
+    try:
+        AES = validate_pc_vault_contract(pw)
+    except Exception as e:
+        sys.exit("PC Vault compatibility check failed: " + str(e))
     if not shutil.which("aria2c"):
         sys.exit("aria2 is not installed. On Debian/Ubuntu/Mint:  sudo apt install aria2")
-    AES = AESGCM(PBKDF2HMAC(hashes.SHA256(), 32, b"vault-v1", 300000).derive(pw.encode()))   # same key as the vault pages
     os.makedirs(DL, exist_ok=True)
     if not shutil.which("yt-dlp"):
         sys.exit("yt-dlp is not installed. Rebuild the Docker image.")
     threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=social_worker, daemon=True).start()
-    print(f"\nVault leech running on port {PORT}. Open http://SERVER-IP:{PORT} and enter your access key.\n")
+    print(
+        f"\nPC Vault v1 compatibility confirmed (9 MiB chunks, AES-GCM/PBKDF2, "
+        f"Discord channel {V.CH}).\n"
+        f"Vault leech running on port {PORT}. Open http://SERVER-IP:{PORT} "
+        "and enter your access key.\n"
+    )
     app.run(host="0.0.0.0", port=PORT, threaded=True)
 
 
