@@ -256,7 +256,7 @@ a{color:#79d6c3;overflow-wrap:anywhere}.result{margin:9px 0}.hidden{display:none
 </style></head><body><main><h1>Vault Media</h1><p>Find openly licensed media and transfer direct files you own or are authorized to save into your encrypted Vault.</p>
 <div class=panel id=loginPanel><label class=small>Worker access key (one-time login)</label><input id=key type=password placeholder='Enter key once' autocomplete=current-password><button id=login>Unlock worker</button><span id=loginStatus class=small></span></div>
 <div class=panel id=appPanel style='display:none'><div class=small>Worker unlocked · session lasts up to 30 days <button id=logout class=tab>Log out</button></div>
-<div><button class='tab active' data-tab='sources'>Sources</button><button class=tab data-tab='subs'>Subtitles</button><button class=tab data-tab='transfer'>Direct transfer</button></div></div>
+<div><button class='tab active' data-tab='sources'>Sources</button><button class=tab data-tab='subs'>Subtitles</button><button class=tab data-tab='transfer'>Direct transfer</button></div>
 <section id=sources>
 <div class=panel><h2>Open media sources</h2><p class=small>Search Wikimedia Commons and Internet Archive. Check the license and rights on the source page before transferring anything.</p>
 <input id=sq placeholder='Search title or topic'><button id=search>Search sources</button><div id=sourceResults></div></div>
