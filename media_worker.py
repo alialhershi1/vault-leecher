@@ -1,4 +1,5 @@
 import os, re, json, time, uuid, queue, threading, tempfile, mimetypes, socket, ipaddress
+from datetime import timedelta
 from urllib.parse import urlparse, unquote
 import requests
 from flask import Flask, request, jsonify, Response, abort, session, redirect
@@ -8,7 +9,7 @@ from cryptography.hazmat.primitives import hashes
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SESSION_SECRET") or os.environ.get("LEECH_KEY", "change-this-session-secret")
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=True, SESSION_COOKIE_SAMESITE="Lax", PERMANENT_SESSION_LIFETIME=30*24*60*60)
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=True, SESSION_COOKIE_SAMESITE="Lax", PERMANENT_SESSION_LIFETIME=timedelta(days=30))
 CHUNK = 9 * 1024 * 1024
 jobs, order, q = {}, [], queue.Queue()
 lock = threading.Lock()
