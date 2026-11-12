@@ -175,7 +175,7 @@ def list_jobs():
 # ---------------------------------------------------------------------------
 # Openly licensed film catalogue (Internet Archive metadata)
 _CC_RE = re.compile(
-    r"^https?://creativecommons\\.org/licenses/(?:by|by-sa|by-nc|by-nc-sa|by-nd|by-nc-nd)/[0-9.]+/?$",
+    r"^https?://creativecommons[.]org/licenses/(?:by|by-sa|by-nc|by-nc-sa|by-nd|by-nc-nd)/[0-9.]+/?$",
     re.I
 )
 _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".ogv")
@@ -409,7 +409,7 @@ a{color:#79d6c3;overflow-wrap:anywhere}.result{margin:9px 0}.hidden{display:none
 </style></head><body><main><h1>Vault Media</h1><p>Find openly licensed media and transfer direct files you own or are authorized to save into your encrypted Vault.</p>
 <div class=panel id=loginPanel><label class=small>Worker access key (one-time login)</label><input id=key type=password placeholder='Enter key once' autocomplete=current-password><button id=login>Unlock worker</button><span id=loginStatus class=small></span></div>
 <div class=panel id=appPanel style='display:none'><div class=small>Worker unlocked · session lasts up to 30 days <button id=logout class=tab>Log out</button></div>
-<div><button class='tab active' data-tab='sources'>Sources</button><button class=tab data-tab='subs'>Subtitles</button><button class=tab data-tab='transfer'>Direct transfer</button></div>
+<div><button class='tab active' data-tab='sources'>Movies &amp; Series</button><button class=tab data-tab='subs'>Subtitles</button><button class=tab data-tab='transfer'>Direct transfer</button></div>
 <section id=sources>
 <div class=panel><h2>Browse openly licensed movies &amp; series</h2><p class=small>Search verified Creative Commons catalogue entries. Open a title to see its available video files and any archive torrent file.</p>
 <input id=movieQuery placeholder='Search movie or series title'><button id=movieSearch>Search</button><div id=movieResults></div>
@@ -422,7 +422,7 @@ a{color:#79d6c3;overflow-wrap:anywhere}.result{margin:9px 0}.hidden{display:none
 </section>
 <section id=subs class=hidden><div class=panel><h2>OpenSubtitles</h2><p class=small>Search subtitles for a video you own or are authorized to use. Requires OPEN_SUBTITLES_API_KEY in Render environment.</p>
 <input id=subq placeholder='Movie or episode title'><select id=lang><option value=en>English</option><option value=ar>Arabic</option><option value=fr>French</option><option value=es>Spanish</option><option value=de>German</option></select><button id=subsearch>Search subtitles</button><div id=subResults></div></div></section>
-<section id=transfer class=hidden><div class=panel><h2>Direct transfer</h2><input id=url placeholder='https://… direct file URL'><button id=add>Send to Vault</button><p class=small id=msg>No application-level file-size limit. Public HTTPS only; redirects and private network addresses are blocked. Hosting and Discord limits still apply.</p></div></section>
+<section id=transfer class=hidden><div class=panel><h2>Direct transfer</h2><input id=url placeholder='https://… direct file URL'><button id=add>Send to Vault</button><p class=small id=msg>No application-level file-size limit. Public HTTPS only; redirects are followed only after each destination is checked. Hosting and Discord limits still apply.</p></div></section>
 <div id=jobs></div></div></main>
 <script>
 const $=s=>document.querySelector(s);
