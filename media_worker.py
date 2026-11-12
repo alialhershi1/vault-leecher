@@ -1,6 +1,6 @@
 import os, re, json, time, uuid, queue, threading, tempfile, mimetypes, socket, ipaddress
 from datetime import timedelta
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, urljoin, quote
 import requests
 from flask import Flask, request, jsonify, Response, abort, session, redirect
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -14,6 +14,7 @@ CHUNK = 9 * 1024 * 1024
 jobs, order, q = {}, [], queue.Queue()
 lock = threading.Lock()
 aes = None
+TORRENT_LEECH_URL = os.environ.get("TORRENT_LEECH_URL", "https://vault-leech-2ls7.onrender.com").strip().rstrip("/")
 
 def config():
     global aes
@@ -67,14 +68,27 @@ def process(j):
     tmp = None
     try:
         j["status"] = "downloading"
-        u = safe_url(j["url"])
-        with requests.get(j["url"], stream=True, timeout=(20,90), allow_redirects=False,
-                          headers={"User-Agent":"VaultMediaWorker/1.0"}) as r:
-            if r.is_redirect:
-                raise ValueError("Redirects are disabled. Use the final HTTPS download URL.")
+        download_url = j["url"]
+        response = None
+        for _hop in range(6):
+            safe_url(download_url)
+            response = requests.get(download_url, stream=True, timeout=(20,90), allow_redirects=False,
+                                    headers={"User-Agent":"VaultMediaWorker/1.0"})
+            if response.is_redirect:
+                location = response.headers.get("Location")
+                response.close()
+                if not location:
+                    raise ValueError("The download source returned an invalid redirect.")
+                download_url = urljoin(download_url, location)
+                continue
+            break
+        else:
+            raise ValueError("Too many download redirects.")
+        with response as r:
             r.raise_for_status()
             length = int(r.headers.get("Content-Length") or 0)
-            name = unquote(os.path.basename(u.path)) or "download.bin"
+            url_path = urlparse(download_url).path
+            name = j.get("name") or unquote(os.path.basename(url_path)) or "download.bin"
             name = re.sub(r"[^A-Za-z0-9._ -]", "_", name)[:120] or "download.bin"
             total = 0
             fd, tmp = tempfile.mkstemp(prefix="vault-media-")
@@ -142,7 +156,8 @@ def add():
     if len(url)>4096: return "URL too long",400
     try: safe_url(url)
     except Exception as e: return str(e),400
-    j={"id":uuid.uuid4().hex[:10],"url":url,"name":"Direct download","status":"queued","pct":0}
+    name = str(d.get("name") or "Direct download").strip()[:180]
+    j={"id":uuid.uuid4().hex[:10],"url":url,"name":name,"status":"queued","pct":0}
     with lock:
         jobs[j["id"]]=j; order.insert(0,j["id"])
         for old in order[50:]: jobs.pop(old,None)
@@ -154,6 +169,203 @@ def add():
 def list_jobs():
     auth()
     with lock: return jsonify([public(jobs[i]) for i in order if i in jobs])
+
+
+
+# ---------------------------------------------------------------------------
+# Openly licensed film catalogue (Internet Archive metadata)
+_CC_RE = re.compile(
+    r"^https?://creativecommons\\.org/licenses/(?:by|by-sa|by-nc|by-nc-sa|by-nd|by-nc-nd)/[0-9.]+/?$",
+    re.I
+)
+_VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".ogv")
+
+
+def _cc_license(value):
+    return bool(_CC_RE.match(str(value or "").strip()))
+
+
+def _ia_metadata(identifier):
+    identifier = str(identifier or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,180}", identifier):
+        raise ValueError("Invalid archive item identifier.")
+    response = requests.get("https://archive.org/metadata/" + quote(identifier, safe="._-"),
+                            timeout=25, headers={"User-Agent":"VaultMediaWorker/1.0"})
+    response.raise_for_status()
+    data = response.json()
+    metadata = data.get("metadata") or {}
+    license_url = metadata.get("licenseurl") or metadata.get("license_url") or ""
+    if not _cc_license(license_url):
+        raise ValueError("This item does not declare a supported Creative Commons licence.")
+    if str(metadata.get("access-restricted-item", "")).lower() in ("true", "1", "yes"):
+        raise ValueError("This archive item is access restricted.")
+    return data, metadata, license_url
+
+
+@app.get("/api/movies/search")
+def movie_search():
+    auth()
+    raw = request.args.get("q", "").strip()[:100]
+    terms = re.findall(r"[A-Za-z0-9]+", raw)
+    if not terms:
+        return jsonify(items=[])
+    query = "mediatype:movies AND licenseurl:* AND title:(" + " AND ".join(terms) + ")"
+    try:
+        response = requests.get("https://archive.org/advancedsearch.php",
+            params={"q":query,"fl[]":["identifier","title","year","licenseurl","creator","description"],
+                    "rows":30,"page":1,"output":"json","sort[]":"downloads desc"},
+            timeout=25, headers={"User-Agent":"VaultMediaWorker/1.0"})
+        response.raise_for_status()
+        docs = response.json().get("response",{}).get("docs",[])
+        items = []
+        for item in docs:
+            lic = item.get("licenseurl") or ""
+            if not _cc_license(lic):
+                continue
+            ident = str(item.get("identifier") or "")
+            if not re.fullmatch(r"[A-Za-z0-9._-]{1,180}", ident):
+                continue
+            creator = item.get("creator") or ""
+            if isinstance(creator, list):
+                creator = ", ".join(str(x) for x in creator[:2])
+            description = item.get("description") or ""
+            if isinstance(description, list):
+                description = " ".join(str(x) for x in description[:2])
+            items.append({"id":ident,"title":str(item.get("title") or ident)[:180],
+                          "year":str(item.get("year") or "")[:12],
+                          "creator":str(creator)[:120],"description":str(description)[:260],
+                          "license":lic,"poster":"https://archive.org/services/img/"+ident,
+                          "page":"https://archive.org/details/"+ident})
+        return jsonify(items=items[:24])
+    except Exception:
+        return jsonify(error="Open-licence film search is temporarily unavailable.",items=[]),502
+
+
+@app.get("/api/movies/item/<identifier>")
+def movie_item(identifier):
+    auth()
+    try:
+        data, metadata, lic = _ia_metadata(identifier)
+        files = []
+        for item in data.get("files") or []:
+            filename = str(item.get("name") or "")
+            lower = filename.lower()
+            is_torrent = lower.endswith(".torrent")
+            is_video = lower.endswith(_VIDEO_EXTS)
+            if not (is_torrent or is_video):
+                continue
+            try:
+                size = int(item.get("size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            if size <= 0:
+                continue
+            files.append({"name":filename,"size":size,"kind":"torrent" if is_torrent else "video",
+                          "format":str(item.get("format") or "")[:80]})
+        files.sort(key=lambda x: (x["kind"] != "video", -x["size"]))
+        creator = metadata.get("creator") or ""
+        if isinstance(creator,list):
+            creator = ", ".join(str(x) for x in creator[:3])
+        desc = metadata.get("description") or ""
+        if isinstance(desc,list):
+            desc = " ".join(str(x) for x in desc[:3])
+        return jsonify(item={"id":identifier,"title":str(metadata.get("title") or identifier)[:180],
+                             "year":str(metadata.get("year") or metadata.get("date") or "")[:20],
+                             "creator":str(creator)[:160],"description":str(desc)[:1800],
+                             "license":lic,"page":"https://archive.org/details/"+identifier},
+                       files=files)
+    except ValueError as exc:
+        return jsonify(error=str(exc)),403
+    except Exception:
+        return jsonify(error="Could not load the source files for this archive item."),502
+
+
+def _upstream_torrent(link):
+    key = os.environ.get("TORRENT_LEECH_KEY") or os.environ.get("LEECH_KEY", "")
+    if not key:
+        raise RuntimeError("Torrent worker access key is not configured.")
+    response = requests.post(TORRENT_LEECH_URL + "/api/add",
+        headers={"X-Key":key,"User-Agent":"VaultMediaWorker/1.0"},
+        json={"link":link}, timeout=35)
+    if response.status_code == 401:
+        raise RuntimeError("The torrent worker rejected its access key. Set TORRENT_LEECH_KEY to the key configured on vault-leech.")
+    response.raise_for_status()
+    return response.json()
+
+
+@app.post("/api/movies/download")
+def movie_download():
+    auth()
+    body = request.get_json(silent=True) or {}
+    identifier = str(body.get("id") or "")
+    filename = str(body.get("filename") or "")
+    kind = str(body.get("kind") or "")
+    try:
+        data, metadata, _lic = _ia_metadata(identifier)
+        match = next((x for x in (data.get("files") or []) if str(x.get("name") or "") == filename), None)
+        if not match:
+            return jsonify(error="That file is not part of the selected archive item."),400
+        lower = filename.lower()
+        if kind == "torrent" and lower.endswith(".torrent"):
+            link = "https://archive.org/download/" + quote(identifier, safe="._-") + "/" + quote(filename, safe="/")
+            job = _upstream_torrent(link)
+            return jsonify(mode="torrent",job=job),202
+        if kind != "video" or not lower.endswith(_VIDEO_EXTS):
+            return jsonify(error="Unsupported source file."),400
+        link = "https://archive.org/download/" + quote(identifier, safe="._-") + "/" + quote(filename, safe="/")
+        safe_url(link)
+        job = {"id":uuid.uuid4().hex[:10],"url":link,"name":os.path.basename(filename),
+               "status":"queued","pct":0}
+        with lock:
+            jobs[job["id"]]=job; order.insert(0,job["id"])
+            for old in order[50:]: jobs.pop(old,None)
+            del order[50:]
+        q.put(job)
+        return jsonify(mode="direct",job=public(job)),202
+    except ValueError as exc:
+        return jsonify(error=str(exc)),403
+    except Exception as exc:
+        return jsonify(error=str(exc)[:260]),502
+
+
+@app.post("/api/torrents/add")
+def torrent_add():
+    auth()
+    body = request.get_json(silent=True) or {}
+    link = str(body.get("link") or "").strip()
+    if link.startswith("magnet:?"):
+        if not body.get("authorized"):
+            return jsonify(error="Confirm that you have permission to download this content."),400
+    else:
+        try:
+            parsed = safe_url(link)
+        except Exception as exc:
+            return jsonify(error=str(exc)),400
+        if not parsed.path.lower().endswith(".torrent"):
+            return jsonify(error="Provide a magnet link or a .torrent file URL."),400
+        if (parsed.hostname or "").lower() not in ("archive.org","www.archive.org"):
+            return jsonify(error="For file-based torrent sources, use a verified Archive item shown in Movies & Series."),400
+        if not body.get("authorized"):
+            return jsonify(error="Confirm that you have permission to download this content."),400
+    try:
+        return jsonify(job=_upstream_torrent(link)),202
+    except Exception as exc:
+        return jsonify(error=str(exc)[:260]),502
+
+
+@app.get("/api/torrents/jobs")
+def torrent_jobs():
+    auth()
+    key = os.environ.get("TORRENT_LEECH_KEY") or os.environ.get("LEECH_KEY", "")
+    try:
+        response = requests.get(TORRENT_LEECH_URL + "/api/jobs",
+            headers={"X-Key":key,"User-Agent":"VaultMediaWorker/1.0"},timeout=20)
+        if response.status_code == 401:
+            return jsonify(error="The torrent worker rejected its access key. Set TORRENT_LEECH_KEY to the key configured on vault-leech.",items=[]),502
+        response.raise_for_status()
+        return jsonify(items=response.json())
+    except Exception as exc:
+        return jsonify(error=str(exc)[:240],items=[]),502
 
 
 @app.get("/api/subtitles")
@@ -199,8 +411,14 @@ a{color:#79d6c3;overflow-wrap:anywhere}.result{margin:9px 0}.hidden{display:none
 <div class=panel id=appPanel style='display:none'><div class=small>Worker unlocked · session lasts up to 30 days <button id=logout class=tab>Log out</button></div>
 <div><button class='tab active' data-tab='sources'>Sources</button><button class=tab data-tab='subs'>Subtitles</button><button class=tab data-tab='transfer'>Direct transfer</button></div>
 <section id=sources>
-<div class=panel><h2>Find official streaming options</h2><p class=small>Search for licensed streaming and rental options for a movie or series. Availability varies by country.</p>
-<input id=sq placeholder='Movie or series title'><button id=search>Find official options</button><div id=sourceResults></div></div>
+<div class=panel><h2>Browse openly licensed movies &amp; series</h2><p class=small>Search verified Creative Commons catalogue entries. Open a title to see its available video files and any archive torrent file.</p>
+<input id=movieQuery placeholder='Search movie or series title'><button id=movieSearch>Search</button><div id=movieResults></div>
+<div id=movieDetail></div>
+</div>
+<div class=panel><h2>Magnet link</h2><p class=small>For a magnet link to content you are authorized to download, paste it here. The existing torrent server downloads it and uploads the files into your Vault.</p>
+<input id=magnetInput placeholder='magnet:?xt=urn:btih:…'><label class=small><input id=magnetAuthorized type=checkbox style='width:auto'> I have permission to download this content</label><br><button id=magnetAdd>Send magnet to server</button><div id=magnetStatus class=small></div>
+</div>
+<div class=panel><h2>Torrent downloads</h2><div id=torrentJobs class=small>Loading torrent queue…</div></div>
 </section>
 <section id=subs class=hidden><div class=panel><h2>OpenSubtitles</h2><p class=small>Search subtitles for a video you own or are authorized to use. Requires OPEN_SUBTITLES_API_KEY in Render environment.</p>
 <input id=subq placeholder='Movie or episode title'><select id=lang><option value=en>English</option><option value=ar>Arabic</option><option value=fr>French</option><option value=es>Spanish</option><option value=de>German</option></select><button id=subsearch>Search subtitles</button><div id=subResults></div></div></section>
@@ -216,10 +434,21 @@ $('#logout').onclick=async()=>{await fetch('/api/logout',{method:'POST',credenti
 (async()=>{try{const r=await api('/api/jobs');if(r.ok)unlock()}catch(e){}})();
 function card(item,kind){const d=document.createElement('div');d.className='result';const n=document.createElement('div');n.className='name';n.textContent=item.title||item.name;const p=document.createElement('p');p.className='small';p.textContent=(item.year||'')+' · '+(item.license||item.language||'')+(item.release?' · '+item.release:'');const a=document.createElement('a');a.href=item.page||item.url;a.target='_blank';a.rel='noopener';a.textContent='Open source / details';d.append(n,p,a);
 if(kind==='file'&&item.url){const b=document.createElement('button');b.textContent='Use direct file';b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x.dataset.tab==='transfer'));['sources','subs','transfer'].forEach(id=>$('#'+id).classList.toggle('hidden',id!=='transfer'));$('#url').value=item.url;};d.append(b)}return d}
-$('#search').onclick=()=>{const q=$('#sq').value.trim(),box=$('#sourceResults');box.replaceChildren();if(!q)return;const d=document.createElement('div');d.className='result';const n=document.createElement('div');n.className='name';n.textContent='Official viewing options for '+q;const p=document.createElement('p');p.className='small';p.textContent='Search for licensed streaming, rental, and purchase availability. Check that the service supports your country.';const a=document.createElement('a');a.href='https://www.google.com/search?q='+encodeURIComponent(q+' official streaming rent watch Lebanon');a.target='_blank';a.rel='noopener';a.textContent='Search official viewing options';d.append(n,p,a);box.append(d)};
+function fmtSize(n){n=Number(n)||0;for(const u of ['B','KB','MB','GB','TB']){if(n<1024||u==='TB')return (u==='B'?Math.round(n):n.toFixed(1))+' '+u;n/=1024}}
+function safeText(el,tag,cls,value){const x=document.createElement(tag);if(cls)x.className=cls;x.textContent=value||'';el.append(x);return x}
+async function findMovies(){const q=$('#movieQuery').value.trim(),box=$('#movieResults');$('#movieDetail').replaceChildren();box.textContent='Searching…';if(!q){box.textContent='Enter a title.';return}
+try{const d=await(await api('/api/movies/search?q='+encodeURIComponent(q))).json();if(d.error)throw Error(d.error);box.replaceChildren();if(!(d.items||[]).length){box.textContent='No clearly licensed matches found. Try another title.';return}
+for(const it of d.items){const card=document.createElement('div');card.className='result';const row=document.createElement('div');row.style.cssText='display:flex;gap:12px;align-items:flex-start';const img=document.createElement('img');img.src=it.poster;img.alt='';img.loading='lazy';img.style.cssText='width:76px;height:108px;object-fit:cover;border-radius:8px;background:#0b111b';const info=document.createElement('div');info.style.minWidth='0';safeText(info,'div','name',it.title);safeText(info,'div','small',(it.year||'')+(it.creator?' · '+it.creator:''));safeText(info,'div','small','Creative Commons licence');const b=document.createElement('button');b.textContent='Show sources';b.onclick=()=>openMovie(it.id);info.append(b);row.append(img,info);card.append(row);box.append(card)}}catch(e){box.textContent=e.message}}
+async function openMovie(id){const box=$('#movieDetail');box.textContent='Loading source files…';try{const d=await(await api('/api/movies/item/'+encodeURIComponent(id))).json();if(!d.item)throw Error(d.error||'Could not load title');box.replaceChildren();const panel=document.createElement('div');panel.className='result';safeText(panel,'div','name',d.item.title+' · '+(d.item.year||''));safeText(panel,'p','small',d.item.description||'No description supplied.');const lic=document.createElement('a');lic.href=d.item.license;lic.target='_blank';lic.rel='noopener';lic.textContent='View Creative Commons licence';panel.append(lic);safeText(panel,'h3','', 'Available files');if(!d.files.length)safeText(panel,'p','small','No video or torrent files are listed for this item.');
+for(const f of d.files){const row=document.createElement('div');row.className='result';const title=document.createElement('div');title.className='name';title.textContent=f.name;const detail=document.createElement('div');detail.className='small';detail.textContent=(f.kind==='torrent'?'Archive torrent':'Video file')+' · '+fmtSize(f.size)+(f.format?' · '+f.format:'');const b=document.createElement('button');b.textContent=f.kind==='torrent'?'Download via torrent server':'Download to Vault';b.onclick=async()=>{b.disabled=true;try{const r=await api('/api/movies/download',{method:'POST',body:JSON.stringify({id,filename:f.name,kind:f.kind})});const result=await r.json();if(!r.ok)throw Error(result.error||'Could not queue this source');b.textContent=result.mode==='torrent'?'Torrent queued':'Queued for Vault';load();loadTorrentJobs()}catch(e){b.disabled=false;detail.textContent=e.message}};row.append(title,detail,b);panel.append(row)}
+box.append(panel)}catch(e){box.textContent=e.message}}
+async function addMagnet(){const link=$('#magnetInput').value.trim(),status=$('#magnetStatus');if(!link)return;try{const r=await api('/api/torrents/add',{method:'POST',body:JSON.stringify({link,authorized:$('#magnetAuthorized').checked})});const d=await r.json();if(!r.ok)throw Error(d.error||'Could not queue magnet');$('#magnetInput').value='';status.textContent='Torrent queued on the server.';loadTorrentJobs()}catch(e){status.textContent=e.message}}
+async function loadTorrentJobs(){const box=$('#torrentJobs');try{const r=await api('/api/torrents/jobs');const d=await r.json();if(!r.ok)throw Error(d.error||'Torrent queue unavailable');box.replaceChildren();if(!d.items.length){box.textContent='No torrent jobs yet.';return}
+for(const j of d.items){const row=document.createElement('div');row.className='result';safeText(row,'div','name',j.name||'Torrent job');const state=(j.status||'unknown')+' · '+(j.pct||0)+'%'+(j.speed?' · '+j.speed:'')+(j.error?' · '+j.error:'');safeText(row,'div','small',state);box.append(row)}}catch(e){box.textContent=e.message}}
+$('#movieSearch').onclick=findMovies;$('#movieQuery').onkeydown=e=>{if(e.key==='Enter')findMovies()};$('#magnetAdd').onclick=addMagnet;
 $('#subsearch').onclick=async()=>{const box=$('#subResults');box.textContent='Searching…';try{const d=await(await fetch('/api/subtitles?q='+encodeURIComponent($('#subq').value)+'&lang='+$('#lang').value)).json();box.replaceChildren();if(d.error){box.textContent=d.error;return}for(const x of d.results||[])box.append(card(x,'page'));if(!box.children.length)box.textContent='No subtitles found.'}catch(e){box.textContent=e.message}};
 $('#add').onclick=async()=>{try{await api('/api/add',{method:'POST',body:JSON.stringify({url:$('#url').value.trim()})});$('#url').value='';$('#msg').textContent='Queued.';load()}catch(e){$('#msg').textContent=e.message;$('#msg').className='small error'}};
-async function load(){if($('#appPanel').style.display==='none')return;try{const data=await(await api('/api/jobs')).json(),box=$('#jobs');box.replaceChildren();for(const j of data){const d=document.createElement('div');d.className='job';const n=document.createElement('div');n.className='name';n.textContent=j.name||'Download';const s=document.createElement('div');s.className='small'+(j.error?' error':'');s.textContent=j.status+' · '+(j.pct||0)+'%'+(j.error?' · '+j.error:'');const b=document.createElement('div');b.className='bar';const v=document.createElement('span');v.style.width=(j.pct||0)+'%';b.append(v);d.append(n,b,s);box.append(d)}}catch(e){}}
+async function load(){if($('#appPanel').style.display==='none')return;try{const data=await(await api('/api/jobs')).json(),box=$('#jobs');box.replaceChildren();for(const j of data){const d=document.createElement('div');d.className='job';const n=document.createElement('div');n.className='name';n.textContent=j.name||'Download';const s=document.createElement('div');s.className='small'+(j.error?' error':'');s.textContent=j.status+' · '+(j.pct||0)+'%'+(j.error?' · '+j.error:'');const b=document.createElement('div');b.className='bar';const v=document.createElement('span');v.style.width=(j.pct||0)+'%';b.append(v);d.append(n,b,s);box.append(d)}}catch(e){}loadTorrentJobs();}
 setInterval(load,2500);</script></body></html>"""
 
 threading.Thread(target=worker,daemon=True).start()
